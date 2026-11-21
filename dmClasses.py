@@ -857,7 +857,7 @@ class dmParameters(dmNode):
         return strList
 
     def GetCustomField(self, book, strFieldName):
-        print 'Method: dmParameters:GetCustomField(book, strCustomFieldName)'
+        if dmGlobals.TraceFunctionMessages: print 'Method: dmParameters:GetCustomField(book, strCustomFieldName)'
         strTemp = book.GetCustomValue(strFieldName)
         if strTemp == None:
             strTemp = ''
