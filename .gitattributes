@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+# Upstream's .ini files are kept byte-exact (BOM, CRLF); still diffed as text
+*.ini -text diff
+
+*.png binary
+*.ico binary
+*.exe binary
