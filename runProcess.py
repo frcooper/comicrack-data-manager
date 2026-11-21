@@ -12,15 +12,16 @@ import dmGlobals
 from dmGlobals import *
 from iniReadWrite import *
 
+UI_UPDATE_MS = 250 # least time between progress-bar updates sent to the window
+
 class runProcess(Form):
     def __init__(self, books, collection):
         self.InitializeComponent()
         self.Icon = Icon(dmGlobals.ICON_SMALL)
         self.Books = books
         self.Collection = collection
-        self.TotalRulesets = 0
-        self.countRuleset = 0
-        self.BookReport = ''
+        self.Summary = ''
+        self._regularFont = Font(self._treeView1.Font, FontStyle.Regular)
         pass
         
     def InitializeComponent(self):
@@ -72,7 +73,7 @@ class runProcess(Form):
         # 
         self._label1.Location = System.Drawing.Point(4, 5)
         self._label1.Name = "label1"
-        self._label1.Size = System.Drawing.Size(252, 23)
+        self._label1.Size = System.Drawing.Size(600, 23) # wide enough for the end-of-run summary
         self._label1.TabIndex = 2
         self._label1.Text = "Processing book 0 of 0"
         self._label1.TextAlign = System.Drawing.ContentAlignment.MiddleLeft
@@ -171,13 +172,16 @@ class runProcess(Form):
         collection = e.Argument[0]
         books = e.Argument[1]
 
+        nl = System.Environment.NewLine
+        total = len(books)
         count = 0
         bookTouchCount = 0
         fieldTouchCount = 0
+        report = System.Text.StringBuilder() # appending to one str was quadratic on big runs
+        lastUpdate = DateTime.MinValue
 
-        userVariables = Dictionary[str,str]()
-
-        strReport = ''
+        # read once, not once per book
+        stampProcessed = ReadKeyAsBool(dmGlobals.USERINI, 'WriteDataManagerProcessed')
 
         if System.IO.File.Exists(dmGlobals.LOGFILE):
             System.IO.File.Delete(dmGlobals.LOGFILE)
@@ -185,40 +189,51 @@ class runProcess(Form):
         dtStart = System.DateTime.Now
         dmGlobals.WriteStartTime()
 
-        while count < len(books) and  not self._bgwProcess.CancellationPending:
-            tmpDic = dmGlobals.CreateBookDict(books[count])
-            if not self._bgwProcess.CancellationPending:
-                self._bgwProcess.ReportProgress((100.0 / len(books)) * count + 1, [count, books[count]])
-                if dmGlobals.TraceGeneralMessages: print 'Processing Ruleset Collection'
-                try:
-                    bookReport, detailedReports = collection.ProcessBook(books[count], self._bgwProcess)
-                except Exception as er:
-                    #report errors instead
-                    strError = 'Book: ' + books[count].CaptionWithoutTitle + ' had an unexpected error occured when processing it' + System.Environment.NewLine
-                    strError += '    Error: ' + er.message + System.Environment.NewLine
-                    self.BookReport += strError
-                if self.BookReport != '' or self.BookReport != None:
-                    strReport = dmGlobals.AppendReport(strReport, self.BookReport)
-                    bookTouchCount = bookTouchCount + 1
-                    fieldTouchCount = fieldTouchCount + dmGlobals.GetTouchCount(books[count], tmpDic)
-                    if ReadKeyAsBool(dmGlobals.USERINI,  'WriteDataManagerProcessed'):
-                       books[count].SetCustomValue('DataManager.processed', DateTime.Now.ToString('yyyy-MM-dd HH:mm:ss'))
+        while count < total and not self._bgwProcess.CancellationPending:
+            book = books[count]
+            tmpDic = dmGlobals.CreateBookDict(book)
+            if dmGlobals.TraceGeneralMessages: print 'Processing Ruleset Collection'
+            # The log is built here from what ProcessBook returns. It used to be built
+            # on the UI thread from the tree view messages, which arrive late, so
+            # entries were dropped, doubled or put under the wrong book.
+            try:
+                bookReport, detailedReports = collection.ProcessBook(book, self._bgwProcess)
+            except Exception as er:
+                #report errors instead
+                bookReport = 'Book: ' + book.CaptionWithoutTitle + ' had an unexpected error occured when processing it' + nl
+                bookReport += '    Error: ' + er.message + nl
+                self._bgwProcess.ReportProgress(-1, [book, bookReport, [('Error', '', bookReport)]])
+            if bookReport:
+                if report.Length > 0: report.Append(nl)
+                report.Append(bookReport)
+                touched = dmGlobals.GetTouchCount(book, tmpDic)
+                if touched > 0:
+                    bookTouchCount += 1
+                    fieldTouchCount += touched
+            if stampProcessed:
+                book.SetCustomValue('DataManager.processed', DateTime.Now.ToString('yyyy-MM-dd HH:mm:ss'))
 
-            count = count + 1
-            self.BookReport = ''
+            count += 1
+            now = DateTime.Now
+            if count == total or (now - lastUpdate).TotalMilliseconds >= UI_UPDATE_MS:
+                self._bgwProcess.ReportProgress(int(count * 100.0 / total), [count, book])
+                lastUpdate = now
+
+        if self._bgwProcess.CancellationPending:
+            report.Append(nl + 'Process cancelled by user')
 
         #add touch count to log
-        strReport = strReport + System.Environment.NewLine + System.Environment.NewLine + bookTouchCount.ToString() + ' Books were modified. ' + fieldTouchCount.ToString() + ' Values were changed'
-        self._bgwProcess.ReportProgress(100, [count, strReport])
-                
+        self.Summary = bookTouchCount.ToString() + ' Books were modified. ' + fieldTouchCount.ToString() + ' Values were changed'
+        report.Append(nl + nl + self.Summary)
+
         #write out report
-        if strReport != '':
-            System.IO.File.WriteAllText(dmGlobals.LOGFILE, strReport)
-        
+        System.IO.File.WriteAllText(dmGlobals.LOGFILE, report.ToString())
+
         dmGlobals.WriteEndTime()
         duration = System.DateTime.Now - dtStart
         strDuration = duration.ToString('hh\:mm\:ss\.ffff')
         dmGlobals.WriteDurationtime(strDuration)
+        self.Summary += ' in ' + strDuration
 
     def BgwProcessProgressChanged(self, sender, e):
         progress = e.ProgressPercentage
@@ -234,33 +249,28 @@ class runProcess(Form):
         else:
             count = userState[0]
             booklen = len(self.Books)
-            self._progressBar1.Value = progress
+            self._progressBar1.Value = max(0, min(100, progress))
             if not isinstance(userState[1], str): self._label2.Text = userState[1].CaptionWithoutTitle
-            self._label1.Text = 'Processing ' + count.ToString() + ' of ' + booklen.ToString() + ' books'
+            self._label1.Text = 'Processed ' + count.ToString() + ' of ' + booklen.ToString() + ' books'
 
     def AddToTreeView(self, userState):
+        """Display only: the log is built by the worker."""
         book = userState[0]
         bookReport = userState[1]
         detailedReports = userState[2]
 
         if detailedReports:
-            bookNode = self._treeView1.Nodes[book.Id.ToString()]
-
-            if not bookNode:
-                bookNode = TreeNode(book.CaptionWithoutTitle)
-                bookNode.Name = book.Id.ToString()
+            bookNode = TreeNode(book.CaptionWithoutTitle)
+            bookNode.Name = book.Id.ToString()
+            bookNode.Tag = bookReport
 
             for reportType, name, report in detailedReports:
-                str = reportType + ": " + name
-                bookReport += report
-                tn = TreeNode(str)
-                tn.Name = book.CaptionWithoutTitle + str
-                tn.NodeFont = Font(self._treeView1.Font, FontStyle.Regular)
+                label = reportType + ": " + name if name else reportType
+                tn = TreeNode(label)
+                tn.NodeFont = self._regularFont
                 tn.Tag = report
                 bookNode.Nodes.Add(tn)
-                # bookNode.Expand()
 
-            self.BookReport += bookReport
             self._treeView1.Nodes.Add(bookNode)
 
     def BtnCancelClick(self,sender, e):
@@ -270,16 +280,18 @@ class runProcess(Form):
             self.Close()
 
     def NodeClicked(self,sender, e):
-        self._textBox1.Text = ""
-        if len(e.Node.Nodes) > 0:
-            for x in e.Node.Nodes:
-                self._textBox1.Text += x.Tag + System.Environment.NewLine
-                pass
-        else:
-            self._textBox1.Text = e.Node.Tag
+        # a book node holds the book's whole report; a child node holds that group's or ruleset's part
+        self._textBox1.Text = e.Node.Tag or ''
 
     def BgwProcessRunWorkerCompleted(self, sender, e):
         self._btnCancel.Text = 'Close'
+        if e.Error is not None:
+            self._label1.Text = 'Data Manager stopped with an error'
+            self._textBox1.Text = e.Error.ToString()
+        else:
+            self._label1.Text = self.Summary
+            if not self._textBox1.Text:
+                self._textBox1.Text = self.Summary + System.Environment.NewLine + 'Full log: ' + dmGlobals.LOGFILE
 
     def RunProcessShown(self, sender, e):
         if len(self.Books) > 0:
